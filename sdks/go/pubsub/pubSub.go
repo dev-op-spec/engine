@@ -60,40 +60,36 @@ func (ps *pubSub) Subscribe(
 	<-chan model.Event,
 	error,
 ) {
-	dstEventChannel := make(chan model.Event, 1000)
+	dstEventChannel := make(chan model.Event)
 
 	go func() {
 		defer close(dstEventChannel)
 
-		publishEventChannel := make(chan model.Event, 1000)
-		defer ps.gcSubscription(publishEventChannel)
+		publishEventChannel := make(chan model.Event)
+		defer ps.closeSubscription(publishEventChannel)
 
 		subscriptionInfo := subscriptionInfo{
 			Filter: filter,
-			// Done is closed when the subscription is garbage collected
-			Done: make(chan struct{}, 1),
+			Done:   make(chan struct{}, 1),
 		}
 
 		ps.subscriptionsMutex.Lock()
 		ps.subscriptions[publishEventChannel] = subscriptionInfo
-		ps.subscriptionsMutex.Unlock()
 
 		// old events
-		eventStoreEventChannel, _ := ps.eventStore.List(ctx, filter)
-		for event := range eventStoreEventChannel {
-			select {
-			case dstEventChannel <- event:
-			case <-ctx.Done():
-				return
-			}
+		err := ps.eventStore.List(ctx, filter, dstEventChannel)
+		if err != nil {
+			return
 		}
+
+		ps.subscriptionsMutex.Unlock()
 
 		// new events
 		for event := range publishEventChannel {
 			select {
-			case dstEventChannel <- event:
 			case <-ctx.Done():
 				return
+			case dstEventChannel <- event:
 			}
 		}
 	}()
@@ -101,7 +97,7 @@ func (ps *pubSub) Subscribe(
 	return dstEventChannel, nil
 }
 
-func (ps *pubSub) gcSubscription(
+func (ps *pubSub) closeSubscription(
 	channel chan model.Event,
 ) {
 	ps.subscriptionsMutex.RLock()
@@ -123,19 +119,15 @@ func (ps *pubSub) Publish(
 	defer ps.subscriptionsMutex.RUnlock()
 
 	for publishEventChannel, subscriptionInfo := range ps.subscriptions {
-
-		RootCallID := getEventRootCallID(event)
-		if !isRootCallIDExcludedByFilter(RootCallID, subscriptionInfo.Filter) {
-
-			// use go routine because this publishEventChannel could be blocked
+		rootCallID := getEventRootCallID(event)
+		if !isRootCallIDExcludedByFilter(rootCallID, subscriptionInfo.Filter) {
+			// use goroutine because this publishEventChannel could be blocked
 			// for valid reasons such as replaying events from event store.
 			//
 			// In such a case, we don't want to hold up delivery to any
 			// other subscriptions
 			go ps.publishToSubscription(publishEventChannel, subscriptionInfo, event)
-
 		}
-
 	}
 }
 
